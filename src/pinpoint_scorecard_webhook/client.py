@@ -131,6 +131,9 @@ class PinpointClient:
             raise ReadOnlyViolationError("READ_ONLY must be true")
         self._settings = settings
         self._sleep = sleep
+        # Every HTTP attempt (including retries) for observability/poll_runs.
+        self.request_count = 0
+        self.retry_count = 0
         self._http = httpx.Client(
             base_url=settings.base_url,
             headers={
@@ -166,27 +169,47 @@ class PinpointClient:
 
     def _get(self, path: str, params: Mapping[str, Any] | None = None) -> JsonDoc:
         max_retries = self._settings.pinpoint_max_retries
+        page = (params or {}).get("page[number]")
         for attempt in range(max_retries + 1):
+            self.request_count += 1
+            started = time.monotonic()
             try:
                 response = self._http.get(path, params=params)
             except httpx.TransportError as exc:
+                elapsed_ms = round((time.monotonic() - started) * 1000)
                 if attempt >= max_retries:
+                    logger.error("http request failed", extra={
+                        "event": "http_error", "method": "GET", "path": path, "page": page,
+                        "error_type": type(exc).__name__, "attempt": attempt + 1,
+                        "duration_ms": elapsed_ms})
                     raise PinpointTransportError(
                         f"{type(exc).__name__} on GET {path} after {attempt + 1} attempts"
                     ) from None
                 delay = self._backoff_delay(attempt, None)
-                logger.warning("transport error on GET %s (%s); retry in %.1fs",
-                               path, type(exc).__name__, delay)
+                self.retry_count += 1
+                logger.warning("http transport error, retrying", extra={
+                    "event": "http_retry", "method": "GET", "path": path, "page": page,
+                    "error_type": type(exc).__name__, "attempt": attempt + 1,
+                    "retry_in_s": round(delay, 2), "duration_ms": elapsed_ms})
                 self._sleep(delay)
                 continue
 
+            elapsed_ms = round((time.monotonic() - started) * 1000)
             if response.status_code in RETRYABLE_STATUS and attempt < max_retries:
                 delay = self._backoff_delay(attempt, response)
-                logger.warning("HTTP %s on GET %s; retry %d/%d in %.1fs",
-                               response.status_code, path, attempt + 1, max_retries, delay)
+                self.retry_count += 1
+                logger.warning("http retryable status, retrying", extra={
+                    "event": "http_retry", "method": "GET", "path": path, "page": page,
+                    "status": response.status_code, "attempt": attempt + 1,
+                    "retry_in_s": round(delay, 2), "duration_ms": elapsed_ms})
                 self._sleep(delay)
                 continue
 
+            level = logging.INFO if response.status_code < 400 else logging.ERROR
+            logger.log(level, "http request", extra={
+                "event": "http_request", "method": "GET", "path": path, "page": page,
+                "status": response.status_code, "attempt": attempt + 1,
+                "duration_ms": elapsed_ms})
             return self._handle(response, path)
         raise AssertionError("unreachable")  # pragma: no cover
 

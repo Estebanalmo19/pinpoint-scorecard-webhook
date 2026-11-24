@@ -12,12 +12,22 @@ import json
 import logging
 import sys
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from pathlib import Path
 
+import psycopg
 from pydantic import ValidationError
 
 from .client import PinpointClient
 from .config import Settings
+from .db_commands import (
+    backend_name,
+    cmd_db_check,
+    cmd_db_migrate,
+    cmd_migrate_sqlite,
+    open_store,
+)
+from .detection import DetectionPolicy
 from .discovery import (
     DiscoveryRun,
     diff_runs,
@@ -28,6 +38,7 @@ from .discovery import (
     summarize,
 )
 from .errors import PinpointError, PinpointNotFoundError, PinpointPermissionError
+from .logging_setup import configure_logging, sanitize
 from .poller import PollResult, poll_once
 from .snapshot import (
     ApplicationSnapshot,
@@ -37,9 +48,10 @@ from .snapshot import (
     snapshot_from_document,
     snapshot_path,
 )
-from .store import StateStore
 
-EXIT_OK, EXIT_ERROR, EXIT_CONFIG = 0, 1, 2
+EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_LOCKED = 0, 1, 2, 3
+
+logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[Settings], PinpointClient]
 
@@ -292,6 +304,8 @@ def render_poll_result(result: PollResult) -> str:
         f"Run status               : {result.status}",
         f"Coverage                 : {_v(result.coverage)} (end_reason={_v(result.end_reason)})",
         f"Pages fetched            : {result.pages_fetched}",
+        f"HTTP requests            : {result.http_requests}",
+        f"Duration                 : {result.duration_ms} ms",
         f"Applications inspected   : {result.applications_inspected}",
         f"Scorecards observed      : {result.scorecards_observed}",
         f"Scorecards synced        : {result.scorecards_synced}",
@@ -302,6 +316,13 @@ def render_poll_result(result: PollResult) -> str:
             ", ".join(f"{k}={v}" for k, v in sorted(result.events_by_type.items())) or "none"
         ),
     ]
+    lines.append(f"Scope key                : {_v(result.scope_key)[:12]}"
+                 + ("  (baseline established by this run)" if result.baseline_established else ""))
+    if result.skipped_by_reason:
+        lines.append("Skipped by reason        : " + ", ".join(
+            f"{k}={v}" for k, v in sorted(result.skipped_by_reason.items())))
+    if result.interrupted_runs_recovered:
+        lines.append(f"Interrupted runs marked  : {result.interrupted_runs_recovered}")
     for reason in result.reasons:
         lines.append(f"Reason                   : {reason}")
     if result.error:
@@ -312,7 +333,14 @@ def render_poll_result(result: PollResult) -> str:
 def cmd_poll_once(args, settings, client_factory) -> int:
     max_pages = args.max_pages or settings.pinpoint_max_pages
     page_size = args.page_size or settings.pinpoint_page_size
-    with StateStore(settings.state_db_path) as store, client_factory(settings) as client:
+    with open_store(settings, backend_name(args, settings)) as store,             client_factory(settings) as client:
+        info = store.describe()
+        print("Backend                  : " + ", ".join(
+            f"{k}={v}" for k, v in info.items() if k in ("backend", "database", "schema", "path")))
+        policy = DetectionPolicy(
+            tolerance=timedelta(seconds=settings.new_completion_tolerance_seconds),
+            max_observation_gap=timedelta(hours=settings.max_observation_gap_hours),
+        )
         result = poll_once(
             client,
             store,
@@ -320,30 +348,41 @@ def cmd_poll_once(args, settings, client_factory) -> int:
             max_pages=max_pages,
             include_confidential=args.include_confidential,
             include_sourced=args.include_sourced,
+            secrets=tuple(settings.secret_values()),
+            policy=policy,
         )
     print(render_poll_result(result))
+    if result.status == "skipped_locked":
+        return EXIT_LOCKED
     return EXIT_ERROR if result.status == "failed" else EXIT_OK
 
 
 def cmd_events(args, settings, client_factory) -> int:
-    """List recent detected events from SQLite (no API call)."""
-    if not settings.state_db_path.exists():
+    """List recent detected events from the state backend (no API call)."""
+    backend = backend_name(args, settings)
+    if backend == "sqlite" and not settings.state_db_path.exists():
         print(f"{settings.state_db_path} not found; run poll-once first", file=sys.stderr)
         return EXIT_ERROR
-    with StateStore(settings.state_db_path) as store:
-        events = store.recent_events(
-            limit=args.limit, event_types=args.type or (), unprocessed_only=args.unprocessed
-        )
+    with open_store(settings, backend) as store:
+        if args.actionable:
+            events = store.actionable_events(limit=args.limit)
+        elif args.review:
+            events = store.events_needing_review(limit=args.limit)
+        else:
+            events = store.recent_events(
+                limit=args.limit, event_types=args.type or (), unprocessed_only=args.unprocessed
+            )
     if not events:
         print("No events.")
         return EXIT_OK
     headers = ("detected_at", "event_type", "application_id", "user_scorecard_id",
-               "prev_status", "new_status", "prev_sentiment", "new_sentiment", "processed_at",
-               "event_id")
+               "prev_status", "new_status", "prev_sentiment", "new_sentiment", "processing",
+               "reason", "event_id")
     rows = [
         (e.detected_at, e.event_type, e.application_id, e.user_scorecard_id,
          _v(e.previous_status), _v(e.new_status), _v(e.previous_sentiment),
-         _v(e.new_sentiment), _v(e.processed_at), e.event_id[:12])
+         _v(e.new_sentiment), _v(e.processing_status), _v(e.processing_reason),
+         e.event_id[:12])
         for e in events
     ]
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
@@ -356,6 +395,9 @@ def cmd_events(args, settings, client_factory) -> int:
 
 
 COMMANDS = {
+    "db-check": (cmd_db_check, "PostgreSQL: connection, version and privileges (read-only)"),
+    "db-migrate": (cmd_db_migrate, "PostgreSQL: apply pending migrations to the authorised schema"),
+    "migrate-sqlite": (cmd_migrate_sqlite, "Copy the SQLite PoC history into PostgreSQL and verify"),
     "poll-once": (cmd_poll_once, "One polling pass: sync scorecards to SQLite, emit events"),
     "events": (cmd_events, "Show recent detected events from SQLite (no API call)"),
     "discover": (cmd_discover, "Scan applications and user scorecards (bounded, read-only)"),
@@ -392,6 +434,15 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--summary-only", action="store_true", help="do not print rows")
             p.add_argument("--no-save", action="store_true", help="do not save the run")
             continue
+        if name in ("poll-once", "events", "migrate-sqlite"):
+            p.add_argument("--backend", choices=("sqlite", "postgres"),
+                           help="override STATE_BACKEND")
+        if name in ("db-check", "db-migrate"):
+            continue
+        if name == "migrate-sqlite":
+            p.add_argument("--source", type=Path, help="SQLite file (default STATE_DB_PATH)")
+            p.add_argument("--verify-only", action="store_true", help="compare without inserting")
+            continue
         if name == "poll-once":
             p.add_argument("--max-pages", type=_positive_int,
                            help="default and maximum: PINPOINT_MAX_PAGES")
@@ -403,6 +454,10 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--limit", type=_positive_int, default=20)
             p.add_argument("--type", action="append", help="filter by event type (repeatable)")
             p.add_argument("--unprocessed", action="store_true", help="only processed_at IS NULL")
+            p.add_argument("--actionable", action="store_true",
+                           help="only events the future Rules Engine may act on")
+            p.add_argument("--review", action="store_true",
+                           help="first sightings recorded for review (review_* reasons)")
             continue
         if name == "discover-diff":
             p.add_argument("--before", type=Path, help="path of the earlier run")
@@ -421,13 +476,6 @@ def _positive_int(value: str) -> int:
     return number
 
 
-def _configure_logging(level: str) -> None:
-    logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # httpx logs every request URL at INFO; keep it quiet.
-    for noisy in ("httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -444,7 +492,7 @@ def main(
                 field = ".".join(str(p) for p in err["loc"]).upper()
                 print(f"config error: {field}: {err['msg']}", file=sys.stderr)
             return EXIT_CONFIG
-    _configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_format, settings.secret_values())
     handler = COMMANDS[args.command][0]
     try:
         return handler(args, settings, client_factory)
@@ -453,6 +501,18 @@ def main(
         return EXIT_ERROR
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except psycopg.OperationalError as exc:
+        message = sanitize(f"{type(exc).__name__}: {exc}", settings.secret_values())
+        logger.error("database connection error", extra={
+            "event": "db_connection_error", "error": message, "command": args.command})
+        print(f"error: database connection failed ({type(exc).__name__})", file=sys.stderr)
+        return EXIT_ERROR
+    except psycopg.Error as exc:
+        message = sanitize(f"{type(exc).__name__}: {exc}", settings.secret_values())
+        logger.error("database error", extra={
+            "event": "db_error", "error": message, "command": args.command})
+        print(f"error: database error ({type(exc).__name__})", file=sys.stderr)
         return EXIT_ERROR
 
 

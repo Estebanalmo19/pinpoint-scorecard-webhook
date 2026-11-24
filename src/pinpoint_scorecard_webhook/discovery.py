@@ -133,6 +133,16 @@ def classify_application(loaded: bool, scorecards: list[ScorecardRecord]) -> str
 # ----------------------------------------------------------------------- run
 
 
+def build_filters(include_confidential: bool = False, include_sourced: bool = False) -> dict[str, str]:
+    """API filters that define the monitoring scope."""
+    filters: dict[str, str] = {}
+    if include_confidential:
+        filters["job_visibility"] = ALL_JOB_VISIBILITIES
+    if include_sourced:
+        filters["stage_basic_type"] = ALL_STAGE_BASIC_TYPES
+    return filters
+
+
 def run_discovery(
     client: PinpointClient,
     *,
@@ -141,11 +151,7 @@ def run_discovery(
     include_confidential: bool = False,
     include_sourced: bool = False,
 ) -> DiscoveryRun:
-    filters: dict[str, str] = {}
-    if include_confidential:
-        filters["job_visibility"] = ALL_JOB_VISIBILITIES
-    if include_sourced:
-        filters["stage_basic_type"] = ALL_STAGE_BASIC_TYPES
+    filters = build_filters(include_confidential, include_sourced)
     scope = {
         "endpoint": "/applications",
         "sort": "id",

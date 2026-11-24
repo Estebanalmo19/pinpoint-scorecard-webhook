@@ -7,14 +7,13 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
 pinpoint-scorecards = "pinpoint_scorecard_webhook.cli:main"
 
 [project.optional-dependencies]
-# Added in the persistence phase, not before.
-db = ["psycopg[binary]>=3.2"]
 dev = [
     "pytest>=8.0",
     "respx>=0.21",
